@@ -1,11 +1,10 @@
-import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter_barcode_scanner_plus/flutter_barcode_scanner_plus.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'pharmacy_wrapper_page.dart';
 
 // ============================================================
-// InventoryListPage
+// InventoryListPage  (unchanged — kept as-is)
 // ============================================================
 class InventoryListPage extends StatefulWidget {
   const InventoryListPage({super.key});
@@ -213,6 +212,8 @@ class _InventoryListPageState extends State<InventoryListPage> {
                             final String shelfSide =
                                 m['shelf_side']?.toString() ?? '';
 
+                            final bool isLowStock = qty > 0 && qty <= 5;
+
                             return Container(
                               margin: const EdgeInsets.only(bottom: 10),
                               padding: const EdgeInsets.all(14),
@@ -353,6 +354,50 @@ class _InventoryListPageState extends State<InventoryListPage> {
                                     ],
                                   ),
                                   const SizedBox(height: 8),
+                                  if (isLowStock)
+                                    Container(
+                                      width: double.infinity,
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 10,
+                                        vertical: 5,
+                                      ),
+                                      margin: const EdgeInsets.only(bottom: 8),
+                                      decoration: BoxDecoration(
+                                        color: const Color.fromRGBO(
+                                          255,
+                                          152,
+                                          0,
+                                          0.15,
+                                        ),
+                                        borderRadius: BorderRadius.circular(8),
+                                        border: Border.all(
+                                          color: const Color.fromRGBO(
+                                            255,
+                                            152,
+                                            0,
+                                            0.5,
+                                          ),
+                                        ),
+                                      ),
+                                      child: const Row(
+                                        children: [
+                                          Icon(
+                                            Icons.warning_amber,
+                                            color: Colors.orange,
+                                            size: 14,
+                                          ),
+                                          SizedBox(width: 6),
+                                          Text(
+                                            '⚠️ LOW STOCK — Only few boxes left!',
+                                            style: TextStyle(
+                                              color: Colors.orange,
+                                              fontSize: 11,
+                                              fontWeight: FontWeight.bold,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
                                   Container(
                                     padding: const EdgeInsets.symmetric(
                                       horizontal: 10,
@@ -428,7 +473,8 @@ class _SellMedicineAndInventoryPageState
   late TabController _tabController;
 
   List<Map<String, dynamic>> allMedicines = [];
-  List<Map<String, dynamic>> filteredMedicines = [];
+  List<Map<String, dynamic>> groupedMedicines = [];
+  List<Map<String, dynamic>> filteredGrouped = [];
   bool loadingMedicines = true;
   final searchController = TextEditingController();
 
@@ -469,7 +515,7 @@ class _SellMedicineAndInventoryPageState
     _tabController.addListener(() => setState(() {}));
     _loadMedicines();
     _loadManufacturers();
-    searchController.addListener(_filterMedicines);
+    searchController.addListener(_filterGrouped);
 
     final preSelected = widget.preSelected;
     if (preSelected != null) {
@@ -483,7 +529,7 @@ class _SellMedicineAndInventoryPageState
         final code = await _scanBarcodeCamera();
         if (code != null && code.isNotEmpty) {
           searchController.text = code;
-          _filterMedicines();
+          _filterGrouped();
         }
       });
     }
@@ -506,16 +552,93 @@ class _SellMedicineAndInventoryPageState
           .from('medicine_boxes')
           .select('*, cartons(*, manufacturers(name, country))')
           .eq('pharmacy_id', PharmacySession.pharmacyId ?? '')
-          .order('medicine_name');
+          .order('medicine_name')
+          .order('expiry_date');
       setState(() {
         allMedicines = List<Map<String, dynamic>>.from(res);
-        filteredMedicines = allMedicines;
+        groupedMedicines = _buildGroupedList(allMedicines);
+        filteredGrouped = groupedMedicines;
         loadingMedicines = false;
       });
     } catch (e) {
       _error('Failed to load medicines: $e');
       setState(() => loadingMedicines = false);
     }
+  }
+
+  List<Map<String, dynamic>> _buildGroupedList(List<Map<String, dynamic>> raw) {
+    final Map<String, List<Map<String, dynamic>>> grouped = {};
+    for (final m in raw) {
+      final String name = (m['medicine_name'] ?? '')
+          .toString()
+          .toLowerCase()
+          .trim();
+      grouped.putIfAbsent(name, () => []).add(m);
+    }
+
+    final List<Map<String, dynamic>> result = [];
+    grouped.forEach((key, batches) {
+      batches.sort((a, b) {
+        final da =
+            DateTime.tryParse(a['expiry_date']?.toString() ?? '') ??
+            DateTime(2100);
+        final db =
+            DateTime.tryParse(b['expiry_date']?.toString() ?? '') ??
+            DateTime(2100);
+        return da.compareTo(db);
+      });
+
+      int totalBoxes = 0;
+      int totalStrips = 0;
+      for (final b in batches) {
+        totalBoxes += (b['quantity'] as int?) ?? 0;
+        final spb = (b['strips_per_box'] as int?) ?? 10;
+        totalStrips +=
+            (b['strips_remaining'] as int?) ??
+            ((b['quantity'] as int?) ?? 0) * spb;
+      }
+
+      String? earliestExpiry;
+      for (final b in batches) {
+        final expStr = b['expiry_date']?.toString();
+        if (expStr != null && expStr.isNotEmpty) {
+          if (earliestExpiry == null || expStr.compareTo(earliestExpiry) < 0) {
+            earliestExpiry = expStr;
+          }
+        }
+      }
+
+      final first = batches.first;
+
+      result.add({
+        'medicine_name': first['medicine_name'],
+        'generic_name': first['generic_name'],
+        'total_boxes': totalBoxes,
+        'total_strips': totalStrips,
+        'batches': batches,
+        'earliest_expiry': earliestExpiry,
+        'cartons': first['cartons'],
+        'price': first['price'],
+      });
+    });
+
+    result.sort(
+      (a, b) => (a['medicine_name'] as String).compareTo(
+        b['medicine_name'] as String,
+      ),
+    );
+    return result;
+  }
+
+  void _filterGrouped() {
+    final q = searchController.text.toLowerCase();
+    setState(() {
+      filteredGrouped = groupedMedicines.where((m) {
+        final name = (m['medicine_name'] ?? '').toString().toLowerCase();
+        final generic = (m['generic_name'] ?? '').toString().toLowerCase();
+        return name.contains(q) || generic.contains(q);
+      }).toList();
+    });
   }
 
   Future<void> _loadManufacturers() async {
@@ -531,57 +654,17 @@ class _SellMedicineAndInventoryPageState
     }
   }
 
-  void _filterMedicines() {
-    final q = searchController.text.toLowerCase();
-    setState(() {
-      filteredMedicines = allMedicines.where((m) {
-        final name = (m['medicine_name'] ?? '').toString().toLowerCase();
-        final generic = (m['generic_name'] ?? '').toString().toLowerCase();
-        final batch = (m['batch_number'] ?? '').toString().toLowerCase();
-        final mfr = (m['cartons']?['manufacturers']?['name'] ?? '')
-            .toString()
-            .toLowerCase();
-        return name.contains(q) ||
-            generic.contains(q) ||
-            batch.contains(q) ||
-            mfr.contains(q);
-      }).toList();
-    });
-  }
-
-  Future<Map<String, dynamic>> _fetchRealCartonInfo(String medicineName) async {
-    try {
-      final rows = await supabase
-          .from('medicine_boxes')
-          .select('quantity, carton_id')
-          .eq('pharmacy_id', PharmacySession.pharmacyId ?? '')
-          .eq('medicine_name', medicineName);
-
-      final List<Map<String, dynamic>> list = List<Map<String, dynamic>>.from(
-        rows,
-      );
-
-      int totalBoxes = 0;
-      final Set<String> uniqueCartons = {};
-      for (final row in list) {
-        totalBoxes += (row['quantity'] as int?) ?? 0;
-        final String cid = row['carton_id']?.toString() ?? '';
-        if (cid.isNotEmpty) uniqueCartons.add(cid);
-      }
-
-      final int cartonCount = uniqueCartons.isEmpty ? 1 : uniqueCartons.length;
-      final int avgBoxes = cartonCount > 0
-          ? (totalBoxes / cartonCount).round()
-          : totalBoxes;
-
-      return {
-        'cartonCount': cartonCount,
-        'totalBoxes': totalBoxes,
-        'avgBoxes': avgBoxes,
-      };
-    } catch (e) {
-      return {'cartonCount': 1, 'totalBoxes': 0, 'avgBoxes': 0};
-    }
+  Future<List<Map<String, dynamic>>> _fetchFifoBatches(
+    String medicineName,
+  ) async {
+    final rows = await supabase
+        .from('medicine_boxes')
+        .select('*, cartons(*, manufacturers(name, country))')
+        .eq('pharmacy_id', PharmacySession.pharmacyId ?? '')
+        .eq('medicine_name', medicineName)
+        .order('expiry_date');
+    final list = List<Map<String, dynamic>>.from(rows);
+    return list.where((r) => (r['quantity'] as int? ?? 0) > 0).toList();
   }
 
   // ── HELPERS ───────────────────────────────────────────────
@@ -623,8 +706,6 @@ class _SellMedicineAndInventoryPageState
   }
 
   // ── BARCODE SCANNING ──────────────────────────────────────
-  // Scans using real camera. Returns the raw scanned string.
-  // Returns null if cancelled or failed.
 
   Future<String?> _scanBarcodeCamera() async {
     try {
@@ -634,7 +715,6 @@ class _SellMedicineAndInventoryPageState
         true,
         ScanMode.BARCODE,
       );
-      // FlutterBarcodeScanner returns '-1' when user cancels
       if (scanned == '-1' || scanned.isEmpty) return null;
       return scanned;
     } catch (e) {
@@ -642,16 +722,10 @@ class _SellMedicineAndInventoryPageState
     }
   }
 
-  // ── LOOKUP MEDICINE IN SUPABASE BY BARCODE VALUE ──────────
-  // Tries to find a matching medicine using the raw barcode string.
-  // Searches medicine_name, generic_name, and batch_number fields.
-  // Returns the first match or null.
-
   Future<Map<String, dynamic>?> _lookupMedicineByBarcode(
     String barcodeValue,
   ) async {
     try {
-      // Try exact batch_number match first
       final byBatch = await supabase
           .from('medicine_boxes')
           .select('*, cartons(*, manufacturers(name, country))')
@@ -663,7 +737,6 @@ class _SellMedicineAndInventoryPageState
           List<Map<String, dynamic>>.from(byBatch);
       if (batchResults.isNotEmpty) return batchResults.first;
 
-      // Try medicine_name partial match
       final byName = await supabase
           .from('medicine_boxes')
           .select('*, cartons(*, manufacturers(name, country))')
@@ -683,24 +756,70 @@ class _SellMedicineAndInventoryPageState
 
   // ── SELL DIALOG ───────────────────────────────────────────
 
-  void _showSellDialog(Map<String, dynamic> medicine) {
-    if (_isExpired(medicine['expiry_date']?.toString())) {
-      _error('This medicine is expired and cannot be sold.');
+  void _showSellDialog(Map<String, dynamic> groupedMedicine) async {
+    final String medicineName =
+        groupedMedicine['medicine_name']?.toString() ?? '';
+
+    final List<Map<String, dynamic>> batches = await _fetchFifoBatches(
+      medicineName,
+    );
+
+    if (batches.isEmpty) {
+      _showOutOfStockDialog(groupedMedicine);
       return;
     }
 
-    final int availableBoxes = (medicine['quantity'] as int?) ?? 0;
-    final int stripsPerBox = (medicine['strips_per_box'] as int?) ?? 10;
-    final int totalStripsAvailable =
-        (medicine['strips_remaining'] as int?) ??
-        (availableBoxes * stripsPerBox);
-
-    if (availableBoxes <= 0 || totalStripsAvailable <= 0) {
-      _showOutOfStockDialog(medicine);
+    final allExpired = batches.every(
+      (b) => _isExpired(b['expiry_date']?.toString()),
+    );
+    if (allExpired) {
+      _error('All batches of this medicine are expired and cannot be sold.');
       return;
     }
 
-    const int availableCartons = 1;
+    final validBatches = batches
+        .where((b) => !_isExpired(b['expiry_date']?.toString()))
+        .toList();
+
+    if (validBatches.isEmpty) {
+      _showOutOfStockDialog(groupedMedicine);
+      return;
+    }
+
+    int totalBoxes = validBatches.fold(
+      0,
+      (s, b) => s + ((b['quantity'] as int?) ?? 0),
+    );
+    int totalStrips = 0;
+    for (final b in validBatches) {
+      final spb = (b['strips_per_box'] as int?) ?? 10;
+      totalStrips +=
+          (b['strips_remaining'] as int?) ??
+          ((b['quantity'] as int?) ?? 0) * spb;
+    }
+
+    if (totalBoxes <= 0 || totalStrips <= 0) {
+      _showOutOfStockDialog(groupedMedicine);
+      return;
+    }
+
+    final firstBatch = validBatches.first;
+    final int stripsPerBox = (firstBatch['strips_per_box'] as int?) ?? 10;
+    final double pricePerBox =
+        double.tryParse(firstBatch['price'].toString()) ?? 0.0;
+    final double pricePerStrip = firstBatch['price_per_strip'] != null
+        ? double.tryParse(firstBatch['price_per_strip'].toString()) ??
+              (pricePerBox / stripsPerBox)
+        : pricePerBox / stripsPerBox;
+    final String genericName =
+        groupedMedicine['generic_name']?.toString() ?? '';
+    final String mfr =
+        firstBatch['cartons']?['manufacturers']?['name']?.toString() ??
+        'Unknown';
+
+    final int safeLimit = _getSafeLimit(medicineName);
+    final String earliestExpiry =
+        validBatches.first['expiry_date']?.toString() ?? 'N/A';
 
     String saleType = 'strip';
     final qtyCtrl = TextEditingController(text: '1');
@@ -708,26 +827,13 @@ class _SellMedicineAndInventoryPageState
     final customerCtrl = TextEditingController();
     final phoneCtrl = TextEditingController();
 
-    final double pricePerBox =
-        double.tryParse(medicine['price'].toString()) ?? 0.0;
-    final double pricePerStrip = medicine['price_per_strip'] != null
-        ? double.tryParse(medicine['price_per_strip'].toString()) ??
-              (pricePerBox / stripsPerBox)
-        : pricePerBox / stripsPerBox;
-
-    final String medicineName = medicine['medicine_name']?.toString() ?? '';
-    final String genericName = medicine['generic_name']?.toString() ?? '';
-    final String batchNumber = medicine['batch_number']?.toString() ?? 'N/A';
-    final String mfr =
-        medicine['cartons']?['manufacturers']?['name']?.toString() ?? 'Unknown';
-    final String expiry = medicine['expiry_date']?.toString() ?? 'N/A';
-    final int safeLimit = _getSafeLimit(medicineName);
+    const int availableCartons = 1;
 
     showDialog(
       context: context,
       builder: (_) => StatefulBuilder(
         builder: (ctx, setDs) {
-          final double pricePerCarton = pricePerBox * availableBoxes;
+          final double pricePerCarton = pricePerBox * totalBoxes;
 
           double unitPrice;
           if (saleType == 'strip') {
@@ -747,16 +853,17 @@ class _SellMedicineAndInventoryPageState
           bool exceedsStock = false;
           String stockHintText = '';
           if (saleType == 'strip') {
-            exceedsStock = enteredQty > totalStripsAvailable;
+            exceedsStock = enteredQty > totalStrips;
             stockHintText =
-                'Available: $totalStripsAvailable strips ($availableBoxes boxes)';
+                'Available: $totalStrips strips ($totalBoxes boxes, ${validBatches.length} batch(es))';
           } else if (saleType == 'box') {
-            exceedsStock = enteredQty > availableBoxes;
-            stockHintText = 'Available: $availableBoxes boxes';
+            exceedsStock = enteredQty > totalBoxes;
+            stockHintText =
+                'Available: $totalBoxes boxes (${validBatches.length} batch(es))';
           } else {
             exceedsStock = enteredQty > availableCartons;
             stockHintText =
-                'Available: $availableCartons carton(s) ($availableBoxes boxes total)';
+                'Available: $availableCartons carton(s) ($totalBoxes boxes total)';
           }
 
           return AlertDialog(
@@ -797,16 +904,12 @@ class _SellMedicineAndInventoryPageState
                     child: Column(
                       children: [
                         _infoRow('🏭 Manufacturer', mfr),
-                        _infoRow('🔢 Batch Number', batchNumber),
-                        _infoRow('📅 Expiry', expiry),
+                        _infoRow('📅 Earliest Expiry', earliestExpiry),
                         _infoRow(
-                          '📦 Stock',
-                          '$availableBoxes boxes  •  $totalStripsAvailable strips',
+                          '📦 Total Stock',
+                          '$totalBoxes boxes  •  $totalStrips strips',
                         ),
-                        _infoRow(
-                          '🏭 Cartons Available',
-                          '$availableCartons carton(s)',
-                        ),
+                        _infoRow('🔄 Active Batches', '${validBatches.length}'),
                         _infoRow('💊 Strips/Box', '$stripsPerBox strips'),
                         _infoRow(
                           '💰 Price/Box',
@@ -820,6 +923,60 @@ class _SellMedicineAndInventoryPageState
                           '🏭 Price/Carton',
                           'BDT ${pricePerCarton.toStringAsFixed(2)}',
                         ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Container(
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: const Color.fromRGBO(68, 138, 255, 0.07),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(
+                        color: const Color.fromRGBO(68, 138, 255, 0.25),
+                      ),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Row(
+                          children: [
+                            Icon(
+                              Icons.format_list_numbered,
+                              color: Colors.blueAccent,
+                              size: 13,
+                            ),
+                            SizedBox(width: 6),
+                            Text(
+                              'FIFO Batch Order (oldest sold first):',
+                              style: TextStyle(
+                                color: Colors.blueAccent,
+                                fontSize: 11,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 6),
+                        ...validBatches.asMap().entries.map((entry) {
+                          final idx = entry.key + 1;
+                          final b = entry.value;
+                          final bQty = (b['quantity'] as int?) ?? 0;
+                          final bBatch = b['batch_number']?.toString() ?? 'N/A';
+                          final bExp = b['expiry_date']?.toString() ?? 'N/A';
+                          return Padding(
+                            padding: const EdgeInsets.only(bottom: 3),
+                            child: Text(
+                              '$idx. Batch $bBatch — $bQty boxes — Exp: $bExp',
+                              style: TextStyle(
+                                color: idx == 1
+                                    ? Colors.greenAccent
+                                    : Colors.white54,
+                                fontSize: 11,
+                              ),
+                            ),
+                          );
+                        }),
                       ],
                     ),
                   ),
@@ -915,8 +1072,8 @@ class _SellMedicineAndInventoryPageState
                       const SizedBox(height: 6),
                       _stockErrorBox(
                         saleType == 'strip'
-                            ? '❌ Only $totalStripsAvailable strips available ($availableBoxes boxes)'
-                            : '❌ Only $availableBoxes boxes available',
+                            ? '❌ Only $totalStrips strips available ($totalBoxes boxes)'
+                            : '❌ Only $totalBoxes boxes available',
                       ),
                     ],
                     const SizedBox(height: 10),
@@ -999,7 +1156,7 @@ class _SellMedicineAndInventoryPageState
                             child: Text(
                               exceedsStock
                                   ? '❌ Not enough cartons in stock.\n   Available: $availableCartons carton(s)'
-                                  : '1 carton = $availableBoxes boxes ($totalStripsAvailable strips total).\nSelling clears ALL stock for this entry.',
+                                  : '1 carton = $totalBoxes boxes ($totalStrips strips total).\nSelling clears ALL stock for this entry.',
                               style: TextStyle(
                                 color: exceedsStock
                                     ? Colors.redAccent
@@ -1072,7 +1229,7 @@ class _SellMedicineAndInventoryPageState
                         const SizedBox(width: 6),
                         Expanded(
                           child: Text(
-                            'Safe limit: $safeLimit units. Selling more requires OTP.',
+                            'Safe limit: $safeLimit units (strips/boxes/cartons). Selling more requires OTP.',
                             style: const TextStyle(
                               color: Colors.orange,
                               fontSize: 11,
@@ -1159,7 +1316,7 @@ class _SellMedicineAndInventoryPageState
 
                         if (qty > safeLimit) {
                           _showHighQtyWarning(
-                            medicine: medicine,
+                            validBatches: validBatches,
                             qty: qty,
                             saleType: saleType,
                             unitPrice: unitPrice,
@@ -1167,13 +1324,12 @@ class _SellMedicineAndInventoryPageState
                             customer: customer,
                             phone: phone,
                             medicineName: medicineName,
-                            batchNumber: batchNumber,
                             stripsPerBox: stripsPerBox,
                             safeLimit: safeLimit,
                           );
                         } else {
-                          await _completeSale(
-                            medicine: medicine,
+                          await _completeSaleWithFifo(
+                            validBatches: validBatches,
                             saleType: saleType,
                             qty: qty,
                             unitPrice: unitPrice,
@@ -1181,7 +1337,6 @@ class _SellMedicineAndInventoryPageState
                             customer: customer,
                             phone: phone,
                             medicineName: medicineName,
-                            batchNumber: batchNumber,
                             stripsPerBox: stripsPerBox,
                           );
                         }
@@ -1359,7 +1514,7 @@ class _SellMedicineAndInventoryPageState
   // ── HIGH QTY WARNING ──────────────────────────────────────
 
   void _showHighQtyWarning({
-    required Map<String, dynamic> medicine,
+    required List<Map<String, dynamic>> validBatches,
     required int qty,
     required String saleType,
     required double unitPrice,
@@ -1367,7 +1522,6 @@ class _SellMedicineAndInventoryPageState
     required String customer,
     required String phone,
     required String medicineName,
-    required String batchNumber,
     required int stripsPerBox,
     required int safeLimit,
   }) {
@@ -1411,7 +1565,7 @@ class _SellMedicineAndInventoryPageState
                   ),
                 ),
                 child: Text(
-                  'You are selling $qty units of $medicineName.\n\nSafe limit is $safeLimit units.\n\nCustomer details required to proceed.',
+                  'You are selling $qty ${saleType}s of $medicineName.\n\nSafe limit is $safeLimit ${saleType}s.\n\nCustomer details required to proceed.',
                   style: const TextStyle(
                     color: Colors.white70,
                     fontSize: 13,
@@ -1466,7 +1620,7 @@ class _SellMedicineAndInventoryPageState
               }
               Navigator.pop(context);
               _showOtpDialog(
-                medicine: medicine,
+                validBatches: validBatches,
                 qty: qty,
                 saleType: saleType,
                 unitPrice: unitPrice,
@@ -1476,7 +1630,6 @@ class _SellMedicineAndInventoryPageState
                 age: age,
                 reason: reason,
                 medicineName: medicineName,
-                batchNumber: batchNumber,
                 stripsPerBox: stripsPerBox,
               );
             },
@@ -1489,7 +1642,7 @@ class _SellMedicineAndInventoryPageState
   // ── OTP DIALOG ────────────────────────────────────────────
 
   void _showOtpDialog({
-    required Map<String, dynamic> medicine,
+    required List<Map<String, dynamic>> validBatches,
     required int qty,
     required String saleType,
     required double unitPrice,
@@ -1499,173 +1652,276 @@ class _SellMedicineAndInventoryPageState
     required int age,
     required String reason,
     required String medicineName,
-    required String batchNumber,
     required int stripsPerBox,
   }) {
-    final String generatedOtp = (100000 + Random().nextInt(900000)).toString();
     final otpCtrl = TextEditingController();
     bool otpError = false;
+    bool otpSent = false;
+    bool sending = false;
+    bool verifying = false;
+    String statusMessage = '';
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(
-          '📱 Demo OTP: $generatedOtp',
-          style: const TextStyle(
-            color: Colors.white,
-            fontWeight: FontWeight.bold,
-          ),
-        ),
-        backgroundColor: Colors.blueAccent,
-        duration: const Duration(seconds: 15),
-      ),
-    );
+    String formattedPhone = phone.trim();
+    if (formattedPhone.startsWith('0') && formattedPhone.length == 11) {
+      formattedPhone = '+880${formattedPhone.substring(1)}';
+    } else if (!formattedPhone.startsWith('+')) {
+      formattedPhone = '+$formattedPhone';
+    }
 
     showDialog(
       context: context,
       barrierDismissible: false,
       builder: (_) => StatefulBuilder(
-        builder: (ctx, setDs) => AlertDialog(
-          backgroundColor: const Color(0xFF1A1A2E),
-          title: const Row(
-            children: [
-              Icon(Icons.verified_user, color: Colors.blueAccent),
-              SizedBox(width: 8),
-              Text(
-                'OTP Verification',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-            ],
-          ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Container(
-                padding: const EdgeInsets.all(14),
-                decoration: BoxDecoration(
-                  color: const Color.fromRGBO(68, 138, 255, 0.12),
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(
-                    color: const Color.fromRGBO(68, 138, 255, 0.4),
+        builder: (ctx, setDs) {
+          Future<void> sendOtp() async {
+            setDs(() {
+              sending = true;
+              statusMessage = '';
+              otpError = false;
+            });
+            try {
+              await supabase.auth.signInWithOtp(phone: formattedPhone);
+              setDs(() {
+                sending = false;
+                otpSent = true;
+                statusMessage =
+                    '✅ OTP sent to $formattedPhone. Check your SMS.';
+              });
+            } catch (e) {
+              setDs(() {
+                sending = false;
+                otpSent = false;
+                statusMessage =
+                    '❌ Failed to send OTP: $e\n\nMake sure the phone number is valid and Supabase phone auth is enabled.';
+              });
+            }
+          }
+
+          Future<void> verifyOtp() async {
+            final token = otpCtrl.text.trim();
+            if (token.length != 6) {
+              setDs(() => otpError = true);
+              return;
+            }
+            setDs(() {
+              verifying = true;
+              otpError = false;
+            });
+            try {
+              final response = await supabase.auth.verifyOTP(
+                phone: formattedPhone,
+                token: token,
+                type: OtpType.sms,
+              );
+
+              if (response.user != null || response.session != null) {
+                if (!ctx.mounted) return;
+                Navigator.pop(ctx);
+                await _saveSuspiciousLog(
+                  medicineName: medicineName,
+                  batchNumber:
+                      validBatches.first['batch_number']?.toString() ?? 'N/A',
+                  qty: qty,
+                  customerName: customerName,
+                  phone: phone,
+                  age: age,
+                  reason: reason,
+                );
+                await _completeSaleWithFifo(
+                  validBatches: validBatches,
+                  saleType: saleType,
+                  qty: qty,
+                  unitPrice: unitPrice,
+                  total: total,
+                  customer: customerName,
+                  phone: phone,
+                  medicineName: medicineName,
+                  stripsPerBox: stripsPerBox,
+                );
+              } else {
+                setDs(() {
+                  verifying = false;
+                  otpError = true;
+                });
+              }
+            } catch (e) {
+              setDs(() {
+                verifying = false;
+                otpError = true;
+                statusMessage = '❌ Verification failed: $e';
+              });
+            }
+          }
+
+          return AlertDialog(
+            backgroundColor: const Color(0xFF1A1A2E),
+            title: const Row(
+              children: [
+                Icon(Icons.verified_user, color: Colors.blueAccent),
+                SizedBox(width: 8),
+                Text(
+                  'OTP Verification',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
                   ),
                 ),
-                child: Column(
-                  children: [
-                    const Icon(Icons.sms, color: Colors.blueAccent, size: 28),
-                    const SizedBox(height: 8),
-                    const Text(
-                      'Demo OTP Sent',
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.bold,
+              ],
+            ),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    color: const Color.fromRGBO(68, 138, 255, 0.12),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(
+                      color: const Color.fromRGBO(68, 138, 255, 0.4),
+                    ),
+                  ),
+                  child: Column(
+                    children: [
+                      const Icon(Icons.sms, color: Colors.blueAccent, size: 28),
+                      const SizedBox(height: 8),
+                      Text(
+                        otpSent
+                            ? '📱 OTP sent to $formattedPhone'
+                            : 'Send OTP to: $formattedPhone',
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontWeight: FontWeight.bold,
+                          fontSize: 13,
+                        ),
+                      ),
+                      if (!otpSent) ...[
+                        const SizedBox(height: 10),
+                        ElevatedButton.icon(
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.blueAccent,
+                          ),
+                          onPressed: sending ? null : sendOtp,
+                          icon: sending
+                              ? const SizedBox(
+                                  width: 16,
+                                  height: 16,
+                                  child: CircularProgressIndicator(
+                                    color: Colors.white,
+                                    strokeWidth: 2,
+                                  ),
+                                )
+                              : const Icon(
+                                  Icons.send,
+                                  color: Colors.white,
+                                  size: 16,
+                                ),
+                          label: Text(
+                            sending ? 'Sending...' : 'Send OTP',
+                            style: const TextStyle(color: Colors.white),
+                          ),
+                        ),
+                      ],
+                      if (statusMessage.isNotEmpty) ...[
+                        const SizedBox(height: 8),
+                        Text(
+                          statusMessage,
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: statusMessage.startsWith('✅')
+                                ? Colors.greenAccent
+                                : Colors.redAccent,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+                if (otpSent) ...[
+                  const SizedBox(height: 16),
+                  TextField(
+                    controller: otpCtrl,
+                    keyboardType: TextInputType.number,
+                    maxLength: 6,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 22,
+                      letterSpacing: 6,
+                      fontWeight: FontWeight.bold,
+                    ),
+                    onChanged: (_) => setDs(() => otpError = false),
+                    decoration: InputDecoration(
+                      hintText: 'Enter OTP',
+                      hintStyle: const TextStyle(
+                        color: Colors.white38,
+                        fontSize: 14,
+                      ),
+                      filled: true,
+                      fillColor: const Color.fromRGBO(255, 255, 255, 0.08),
+                      counterStyle: const TextStyle(color: Colors.white38),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(14),
+                        borderSide: BorderSide.none,
                       ),
                     ),
-                    const SizedBox(height: 4),
-                    Text(
-                      generatedOtp,
-                      style: const TextStyle(
-                        color: Colors.blueAccent,
-                        fontSize: 28,
-                        fontWeight: FontWeight.bold,
-                        letterSpacing: 6,
-                      ),
-                    ),
-                    const SizedBox(height: 4),
+                  ),
+                  if (otpError)
                     const Text(
-                      '(In real app sent via SMS)',
-                      style: TextStyle(color: Colors.white38, fontSize: 11),
+                      '❌ Incorrect OTP. Try again.',
+                      style: TextStyle(color: Colors.redAccent, fontSize: 12),
                     ),
-                  ],
+                  TextButton.icon(
+                    onPressed: sending ? null : sendOtp,
+                    icon: const Icon(
+                      Icons.refresh,
+                      color: Colors.white38,
+                      size: 14,
+                    ),
+                    label: const Text(
+                      'Resend OTP',
+                      style: TextStyle(color: Colors.white38, fontSize: 12),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text(
+                  'Cancel',
+                  style: TextStyle(color: Colors.white54),
                 ),
               ),
-              const SizedBox(height: 16),
-              TextField(
-                controller: otpCtrl,
-                keyboardType: TextInputType.number,
-                maxLength: 6,
-                textAlign: TextAlign.center,
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 22,
-                  letterSpacing: 6,
-                  fontWeight: FontWeight.bold,
-                ),
-                onChanged: (_) => setDs(() => otpError = false),
-                decoration: InputDecoration(
-                  hintText: 'Enter OTP',
-                  hintStyle: const TextStyle(
-                    color: Colors.white38,
-                    fontSize: 14,
+              if (otpSent)
+                ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.blueAccent,
                   ),
-                  filled: true,
-                  fillColor: const Color.fromRGBO(255, 255, 255, 0.08),
-                  counterStyle: const TextStyle(color: Colors.white38),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(14),
-                    borderSide: BorderSide.none,
+                  icon: verifying
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(
+                            color: Colors.white,
+                            strokeWidth: 2,
+                          ),
+                        )
+                      : const Icon(Icons.check, color: Colors.white, size: 16),
+                  label: Text(
+                    verifying ? 'Verifying...' : 'Verify & Sell',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.bold,
+                    ),
                   ),
-                ),
-              ),
-              if (otpError)
-                const Text(
-                  '❌ Incorrect OTP. Try again.',
-                  style: TextStyle(color: Colors.redAccent, fontSize: 12),
+                  onPressed: verifying ? null : verifyOtp,
                 ),
             ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text(
-                'Cancel',
-                style: TextStyle(color: Colors.white54),
-              ),
-            ),
-            ElevatedButton.icon(
-              style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.blueAccent,
-              ),
-              icon: const Icon(Icons.check, color: Colors.white, size: 16),
-              label: const Text(
-                'Verify & Sell',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-              onPressed: () async {
-                if (otpCtrl.text.trim() == generatedOtp) {
-                  Navigator.pop(context);
-                  await _saveSuspiciousLog(
-                    medicineName: medicineName,
-                    batchNumber: batchNumber,
-                    qty: qty,
-                    customerName: customerName,
-                    phone: phone,
-                    age: age,
-                    reason: reason,
-                  );
-                  await _completeSale(
-                    medicine: medicine,
-                    saleType: saleType,
-                    qty: qty,
-                    unitPrice: unitPrice,
-                    total: total,
-                    customer: customerName,
-                    phone: phone,
-                    medicineName: medicineName,
-                    batchNumber: batchNumber,
-                    stripsPerBox: stripsPerBox,
-                  );
-                } else {
-                  setDs(() => otpError = true);
-                }
-              },
-            ),
-          ],
-        ),
+          );
+        },
       ),
     );
   }
@@ -1698,10 +1954,10 @@ class _SellMedicineAndInventoryPageState
     }
   }
 
-  // ── COMPLETE SALE ─────────────────────────────────────────
+  // ── COMPLETE SALE WITH FIFO ───────────────────────────────
 
-  Future<void> _completeSale({
-    required Map<String, dynamic> medicine,
+  Future<void> _completeSaleWithFifo({
+    required List<Map<String, dynamic>> validBatches,
     required String saleType,
     required int qty,
     required double unitPrice,
@@ -1709,17 +1965,104 @@ class _SellMedicineAndInventoryPageState
     required String customer,
     required String phone,
     required String medicineName,
-    required String batchNumber,
     required int stripsPerBox,
   }) async {
     try {
       final userId = supabase.auth.currentUser?.id;
-      final String medicineId = medicine['id'].toString();
-      final String cartonId = medicine['carton_id']?.toString() ?? '';
+
+      int stripsToDeduct;
+      if (saleType == 'carton') {
+        stripsToDeduct = validBatches.fold(
+          0,
+          (s, b) =>
+              s +
+              ((b['strips_remaining'] as int?) ??
+                  ((b['quantity'] as int?) ?? 0) *
+                      ((b['strips_per_box'] as int?) ?? stripsPerBox)),
+        );
+      } else if (saleType == 'box') {
+        stripsToDeduct = qty * stripsPerBox;
+      } else {
+        stripsToDeduct = qty;
+      }
+
+      final int totalAvailableStrips = validBatches.fold(
+        0,
+        (s, b) =>
+            s +
+            ((b['strips_remaining'] as int?) ??
+                ((b['quantity'] as int?) ?? 0) *
+                    ((b['strips_per_box'] as int?) ?? stripsPerBox)),
+      );
+
+      if (stripsToDeduct > totalAvailableStrips) {
+        _error('Not enough stock. Please refresh and try again.');
+        return;
+      }
+
+      int remaining = stripsToDeduct;
+      String firstBatchSold =
+          validBatches.first['batch_number']?.toString() ?? 'N/A';
+
+      final List<Map<String, dynamic>> salesBreakdown = [];
+
+      for (final batch in validBatches) {
+        if (remaining <= 0) break;
+
+        final String batchId = batch['id'].toString();
+        final String cartonId = batch['carton_id']?.toString() ?? '';
+        final int spb = (batch['strips_per_box'] as int?) ?? stripsPerBox;
+        final int currentStrips =
+            (batch['strips_remaining'] as int?) ??
+            ((batch['quantity'] as int?) ?? 0) * spb;
+
+        if (currentStrips <= 0) continue;
+
+        final int deductFromThis = remaining < currentStrips
+            ? remaining
+            : currentStrips;
+        remaining -= deductFromThis;
+
+        final int newStrips = (currentStrips - deductFromThis).clamp(
+          0,
+          currentStrips,
+        );
+        final int newBoxes = (spb > 0 && newStrips > 0)
+            ? (newStrips / spb).ceil()
+            : 0;
+
+        if (newBoxes <= 0) {
+          await supabase.from('medicine_boxes').delete().eq('id', batchId);
+        } else {
+          await supabase
+              .from('medicine_boxes')
+              .update({'quantity': newBoxes, 'strips_remaining': newStrips})
+              .eq('id', batchId);
+        }
+
+        if (cartonId.isNotEmpty) {
+          await _deleteCartonIfEmpty(cartonId);
+        }
+
+        salesBreakdown.add({
+          'batchId': batchId,
+          'batchNumber': batch['batch_number']?.toString() ?? 'N/A',
+          'stripsDeducted': deductFromThis,
+          'newBoxes': newBoxes,
+          'newStrips': newStrips,
+          'spb': spb,
+        });
+      }
+
+      final String batchBreakdownDesc = salesBreakdown
+          .map(
+            (s) => 'Batch ${s['batchNumber']}: ${s['stripsDeducted']} strips',
+          )
+          .join(', ');
 
       await supabase.from('sales').insert({
         'medicine_name': medicineName,
-        'batch_number': batchNumber,
+        'batch_number': firstBatchSold,
         'sale_type': saleType,
         'quantity_sold': qty,
         'unit_price': unitPrice,
@@ -1730,63 +2073,37 @@ class _SellMedicineAndInventoryPageState
         'pharmacy_id': PharmacySession.pharmacyId,
       });
 
-      final freshRow = await supabase
-          .from('medicine_boxes')
-          .select('quantity, strips_per_box, strips_remaining')
-          .eq('id', medicineId)
-          .single();
-
-      final int currentBoxes = (freshRow['quantity'] as int?) ?? 0;
-      final int spb = (freshRow['strips_per_box'] as int?) ?? stripsPerBox;
-      final int currentStrips =
-          (freshRow['strips_remaining'] as int?) ?? (currentBoxes * spb);
-
-      int stripsToDeduct;
-      if (saleType == 'carton') {
-        stripsToDeduct = currentStrips;
-      } else if (saleType == 'box') {
-        stripsToDeduct = qty * spb;
-      } else {
-        stripsToDeduct = qty;
-      }
-
-      final int newStrips = (currentStrips - stripsToDeduct).clamp(
-        0,
-        currentStrips,
-      );
-      final int newBoxes = (spb > 0 && newStrips > 0)
-          ? (newStrips / spb).ceil()
-          : 0;
-
-      if (newBoxes <= 0) {
-        await supabase.from('medicine_boxes').delete().eq('id', medicineId);
-      } else {
-        await supabase
-            .from('medicine_boxes')
-            .update({'quantity': newBoxes, 'strips_remaining': newStrips})
-            .eq('id', medicineId);
-      }
-
-      if (cartonId.isNotEmpty) {
-        await _deleteCartonIfEmpty(cartonId);
-      }
+      debugPrint('FIFO sale breakdown: $batchBreakdownDesc');
 
       if (!mounted) return;
       _loadMedicines();
       _loadManufacturers();
 
+      final int totalNewBoxes = salesBreakdown.fold(
+        0,
+        (s, b) => s + (b['newBoxes'] as int),
+      );
+      final int totalNewStrips = salesBreakdown.fold(
+        0,
+        (s, b) => s + (b['newStrips'] as int),
+      );
+      final int spbForReceipt = salesBreakdown.isNotEmpty
+          ? salesBreakdown.first['spb'] as int
+          : stripsPerBox;
+
       _showReceipt(
         medicineName: medicineName,
-        batchNumber: batchNumber,
+        batchNumber: firstBatchSold,
         saleType: saleType,
         qty: qty,
         unitPrice: unitPrice,
         total: total,
         customer: customer,
         phone: phone,
-        newBoxes: newBoxes,
-        newStrips: newStrips,
-        spb: spb,
+        newBoxes: totalNewBoxes,
+        newStrips: totalNewStrips,
+        spb: spbForReceipt,
+        batchesUsed: salesBreakdown.length,
       );
     } catch (e) {
       _error('Sale failed: $e');
@@ -1830,6 +2147,7 @@ class _SellMedicineAndInventoryPageState
     required int newBoxes,
     required int newStrips,
     required int spb,
+    int batchesUsed = 1,
   }) {
     final now = DateTime.now();
     final dateStr =
@@ -1842,6 +2160,7 @@ class _SellMedicineAndInventoryPageState
 
     final int partialStrips = (spb > 0) ? (newStrips % spb) : 0;
     final bool hasPartialBox = newBoxes > 0 && partialStrips != 0;
+    final bool isLowStockAfterSale = newBoxes > 0 && newBoxes <= 5;
 
     showDialog(
       context: context,
@@ -1896,7 +2215,9 @@ class _SellMedicineAndInventoryPageState
               const SizedBox(height: 12),
               const Divider(color: Colors.white24),
               _infoRow('💊 Medicine', medicineName),
-              _infoRow('🔢 Batch', batchNumber),
+              _infoRow('🔢 Batch (primary)', batchNumber),
+              if (batchesUsed > 1)
+                _infoRow('🔄 Batches used (FIFO)', '$batchesUsed batches'),
               _infoRow('📦 Type', saleType.toUpperCase()),
               _infoRow('🔢 Quantity Sold', '$qty'),
               _infoRow('💰 Unit Price', 'BDT ${unitPrice.toStringAsFixed(2)}'),
@@ -1929,14 +2250,14 @@ class _SellMedicineAndInventoryPageState
                 decoration: BoxDecoration(
                   color: newBoxes == 0
                       ? const Color.fromRGBO(255, 82, 82, 0.12)
-                      : newBoxes <= 2
+                      : isLowStockAfterSale
                       ? const Color.fromRGBO(255, 152, 0, 0.12)
                       : const Color.fromRGBO(76, 175, 80, 0.12),
                   borderRadius: BorderRadius.circular(10),
                   border: Border.all(
                     color: newBoxes == 0
                         ? const Color.fromRGBO(255, 82, 82, 0.4)
-                        : newBoxes <= 2
+                        : isLowStockAfterSale
                         ? const Color.fromRGBO(255, 152, 0, 0.4)
                         : const Color.fromRGBO(76, 175, 80, 0.4),
                   ),
@@ -1948,7 +2269,7 @@ class _SellMedicineAndInventoryPageState
                       style: TextStyle(
                         color: newBoxes == 0
                             ? Colors.redAccent
-                            : newBoxes <= 2
+                            : isLowStockAfterSale
                             ? Colors.orange
                             : Colors.greenAccent,
                         fontSize: 12,
@@ -1970,7 +2291,7 @@ class _SellMedicineAndInventoryPageState
                           style: TextStyle(
                             color: newBoxes == 0
                                 ? Colors.redAccent
-                                : newBoxes <= 2
+                                : isLowStockAfterSale
                                 ? Colors.orange
                                 : Colors.greenAccent,
                             fontSize: 16,
@@ -2023,10 +2344,11 @@ class _SellMedicineAndInventoryPageState
                           fontWeight: FontWeight.bold,
                         ),
                       ),
-                    ] else if (newBoxes <= 2) ...[
+                    ] else if (isLowStockAfterSale) ...[
                       const SizedBox(height: 4),
                       const Text(
-                        '⚠️ LOW STOCK — Reorder soon',
+                        '⚠️ LOW STOCK — Only ≤5 boxes left! Reorder soon.',
+                        textAlign: TextAlign.center,
                         style: TextStyle(
                           color: Colors.orange,
                           fontSize: 12,
@@ -2063,11 +2385,6 @@ class _SellMedicineAndInventoryPageState
   }
 
   // ── ADD / EDIT MEDICINE BOX ───────────────────────────────
-  // FEATURE 1: Scan Barcode button at top.
-  // When tapped → opens camera → scans barcode → looks up medicine in DB
-  // → auto-fills ALL fields (name, generic, batch, expiry, price, strips, unit)
-  // No dialog or manual input is shown for the barcode value itself.
-  // All fields remain editable after auto-fill.
 
   void _showMedicineBoxDialog(
     String cartonId,
@@ -2114,9 +2431,7 @@ class _SellMedicineAndInventoryPageState
     final bool isEditing = existing != null;
     final String existingId = existing?['id']?.toString() ?? '';
 
-    // Tracks whether a barcode scan is in progress
     bool isScanning = false;
-    // Message shown after scan attempt
     String scanStatusMessage = '';
     bool scanSuccess = false;
 
@@ -2124,23 +2439,15 @@ class _SellMedicineAndInventoryPageState
       context: context,
       builder: (_) => StatefulBuilder(
         builder: (ctx, setDs) {
-          // ── BARCODE SCAN HANDLER ─────────────────────────
-          // Step 1: Open camera and scan
-          // Step 2: Look up scanned value in DB (no manual input dialog)
-          // Step 3: If found → auto-fill fields
-          // Step 4: If not found → show "not found" message, keep fields empty
-
           Future<void> handleBarcodeScan() async {
             setDs(() {
               isScanning = true;
               scanStatusMessage = '';
             });
 
-            // Open camera scanner directly — no manual input dialog here
             final String? scanned = await _scanBarcodeCamera();
 
             if (scanned == null || scanned.isEmpty) {
-              // User cancelled scan
               setDs(() {
                 isScanning = false;
                 scanStatusMessage = '';
@@ -2148,42 +2455,31 @@ class _SellMedicineAndInventoryPageState
               return;
             }
 
-            // Look up the scanned barcode in the inventory database
             final Map<String, dynamic>? found = await _lookupMedicineByBarcode(
               scanned,
             );
 
             if (found != null) {
-              // Found a matching medicine — auto-fill all fields
               setDs(() {
                 isScanning = false;
                 scanSuccess = true;
                 scanStatusMessage =
                     '✅ Medicine found! Fields auto-filled. You can still edit them.';
 
-                // Fill each field only if data exists
-                if ((found['medicine_name'] ?? '').toString().isNotEmpty) {
+                if ((found['medicine_name'] ?? '').toString().isNotEmpty)
                   nameCtrl.text = found['medicine_name'].toString();
-                }
-                if ((found['generic_name'] ?? '').toString().isNotEmpty) {
+                if ((found['generic_name'] ?? '').toString().isNotEmpty)
                   genericCtrl.text = found['generic_name'].toString();
-                }
-                if ((found['batch_number'] ?? '').toString().isNotEmpty) {
+                if ((found['batch_number'] ?? '').toString().isNotEmpty)
                   batchCtrl.text = found['batch_number'].toString();
-                }
-                if ((found['expiry_date'] ?? '').toString().isNotEmpty) {
+                if ((found['expiry_date'] ?? '').toString().isNotEmpty)
                   expiryCtrl.text = found['expiry_date'].toString();
-                }
-                if ((found['price'] ?? '').toString().isNotEmpty) {
+                if ((found['price'] ?? '').toString().isNotEmpty)
                   priceCtrl.text = found['price'].toString();
-                }
-                if ((found['strips_per_box'] ?? '').toString().isNotEmpty) {
+                if ((found['strips_per_box'] ?? '').toString().isNotEmpty)
                   stripsCtrl.text = found['strips_per_box'].toString();
-                }
-                if ((found['price_per_strip'] ?? '').toString().isNotEmpty) {
+                if ((found['price_per_strip'] ?? '').toString().isNotEmpty)
                   stripPriceCtrl.text = found['price_per_strip'].toString();
-                }
-                // Fill unit if valid
                 final String foundUnit = found['unit']?.toString() ?? '';
                 if (foundUnit.isNotEmpty && _units.contains(foundUnit)) {
                   selectedUnit = foundUnit;
@@ -2191,7 +2487,6 @@ class _SellMedicineAndInventoryPageState
                 }
               });
             } else {
-              // Barcode scanned but no matching medicine found in DB
               setDs(() {
                 isScanning = false;
                 scanSuccess = false;
@@ -2220,7 +2515,6 @@ class _SellMedicineAndInventoryPageState
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  // Manufacturer badge
                   Container(
                     padding: const EdgeInsets.all(10),
                     decoration: BoxDecoration(
@@ -2246,11 +2540,6 @@ class _SellMedicineAndInventoryPageState
                     ),
                   ),
                   const SizedBox(height: 12),
-
-                  // ── SCAN BARCODE BUTTON ──────────────────
-                  // Tapping this opens the camera directly.
-                  // No manual barcode input dialog is shown.
-                  // After scan: looks up in DB and auto-fills fields.
                   Row(
                     children: [
                       Expanded(
@@ -2288,8 +2577,6 @@ class _SellMedicineAndInventoryPageState
                       ),
                     ],
                   ),
-
-                  // Scan result message
                   if (scanStatusMessage.isNotEmpty) ...[
                     const SizedBox(height: 8),
                     Container(
@@ -2334,7 +2621,6 @@ class _SellMedicineAndInventoryPageState
                       ),
                     ),
                   ],
-
                   const SizedBox(height: 10),
                   Row(
                     children: [
@@ -2358,8 +2644,6 @@ class _SellMedicineAndInventoryPageState
                     ],
                   ),
                   const SizedBox(height: 10),
-
-                  // ── MANUAL ENTRY FIELDS ──────────────────
                   _dialogField(nameCtrl, 'Medicine Name *', Icons.medication),
                   const SizedBox(height: 10),
                   _dialogField(
@@ -3133,6 +3417,8 @@ class _SellMedicineAndInventoryPageState
                       ? (stripsRem % spb == 0 ? spb : stripsRem % spb)
                       : 0;
 
+                  final bool isBatchLowStock = qty > 0 && qty <= 5;
+
                   return Container(
                     margin: const EdgeInsets.fromLTRB(10, 0, 10, 10),
                     padding: const EdgeInsets.all(10),
@@ -3231,6 +3517,30 @@ class _SellMedicineAndInventoryPageState
                           ],
                         ),
                         const SizedBox(height: 6),
+                        if (isBatchLowStock && !isExpired)
+                          Container(
+                            width: double.infinity,
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 3,
+                            ),
+                            margin: const EdgeInsets.only(bottom: 6),
+                            decoration: BoxDecoration(
+                              color: const Color.fromRGBO(255, 152, 0, 0.15),
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(
+                                color: const Color.fromRGBO(255, 152, 0, 0.5),
+                              ),
+                            ),
+                            child: const Text(
+                              '⚠️ LOW STOCK — ≤5 boxes remaining!',
+                              style: TextStyle(
+                                color: Colors.orange,
+                                fontSize: 10,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ),
                         Container(
                           padding: const EdgeInsets.all(8),
                           decoration: BoxDecoration(
@@ -4098,7 +4408,7 @@ class _SellMedicineAndInventoryPageState
                   style: const TextStyle(color: Colors.white),
                   decoration: InputDecoration(
                     prefixIcon: const Icon(Icons.search, color: Colors.white70),
-                    hintText: 'Search name, generic, batch...',
+                    hintText: 'Search name, generic...',
                     hintStyle: const TextStyle(color: Colors.white38),
                     filled: true,
                     fillColor: const Color.fromRGBO(255, 255, 255, 0.08),
@@ -4110,7 +4420,6 @@ class _SellMedicineAndInventoryPageState
                 ),
               ),
               const SizedBox(width: 10),
-              // Barcode scan button for sell tab — fills search field
               Container(
                 decoration: BoxDecoration(
                   color: Colors.blueAccent,
@@ -4122,7 +4431,7 @@ class _SellMedicineAndInventoryPageState
                     final String? scanned = await _scanBarcodeCamera();
                     if (scanned != null && scanned.isNotEmpty) {
                       searchController.text = scanned;
-                      _filterMedicines();
+                      _filterGrouped();
                     }
                   },
                   tooltip: 'Scan Barcode',
@@ -4137,7 +4446,7 @@ class _SellMedicineAndInventoryPageState
               ? const Center(
                   child: CircularProgressIndicator(color: Colors.blueAccent),
                 )
-              : filteredMedicines.isEmpty
+              : filteredGrouped.isEmpty
               ? Center(
                   child: Column(
                     mainAxisAlignment: MainAxisAlignment.center,
@@ -4159,28 +4468,29 @@ class _SellMedicineAndInventoryPageState
                 )
               : ListView.builder(
                   padding: const EdgeInsets.symmetric(horizontal: 16),
-                  itemCount: filteredMedicines.length,
+                  itemCount: filteredGrouped.length,
                   itemBuilder: (_, i) {
-                    final m = filteredMedicines[i];
-                    final bool isExpired = _isExpired(
-                      m['expiry_date']?.toString(),
-                    );
-                    final Color statusColor = _expiryColor(
-                      m['expiry_date']?.toString(),
-                    );
-                    final int qty = (m['quantity'] as int?) ?? 0;
-                    final int spb = (m['strips_per_box'] as int?) ?? 10;
-                    final int stripsRem =
-                        (m['strips_remaining'] as int?) ?? (qty * spb);
-                    final String batch = m['batch_number']?.toString() ?? 'N/A';
-                    final bool outOfStock = !isExpired && qty <= 0;
-                    final String medicineName =
-                        m['medicine_name']?.toString() ?? '';
+                    final m = filteredGrouped[i];
+                    final int totalBoxes = (m['total_boxes'] as int?) ?? 0;
+                    final int totalStrips = (m['total_strips'] as int?) ?? 0;
+                    final List<Map<String, dynamic>> batches =
+                        List<Map<String, dynamic>>.from(m['batches'] ?? []);
+                    final String? earliestExpiry = m['earliest_expiry']
+                        ?.toString();
+                    final Color expColor = _expiryColor(earliestExpiry);
+                    final String mfrName =
+                        m['cartons']?['manufacturers']?['name']?.toString() ??
+                        'Unknown';
+
+                    final bool isLowStock = totalBoxes > 0 && totalBoxes <= 5;
+                    final bool outOfStock = totalBoxes <= 0;
+
+                    final int activeBatches = batches
+                        .where((b) => !_isExpired(b['expiry_date']?.toString()))
+                        .length;
 
                     return Card(
-                      color: isExpired
-                          ? const Color.fromRGBO(244, 67, 54, 0.15)
-                          : outOfStock
+                      color: outOfStock
                           ? const Color.fromRGBO(100, 100, 100, 0.15)
                           : const Color.fromRGBO(255, 255, 255, 0.10),
                       margin: const EdgeInsets.only(bottom: 10),
@@ -4195,13 +4505,13 @@ class _SellMedicineAndInventoryPageState
                               Row(
                                 children: [
                                   CircleAvatar(
-                                    backgroundColor: statusColor.withValues(
+                                    backgroundColor: expColor.withValues(
                                       alpha: 0.2,
                                     ),
                                     radius: 20,
                                     child: Icon(
                                       Icons.medication,
-                                      color: statusColor,
+                                      color: expColor,
                                       size: 18,
                                     ),
                                   ),
@@ -4212,7 +4522,7 @@ class _SellMedicineAndInventoryPageState
                                           CrossAxisAlignment.start,
                                       children: [
                                         Text(
-                                          medicineName,
+                                          m['medicine_name'] ?? '',
                                           style: const TextStyle(
                                             color: Colors.white,
                                             fontWeight: FontWeight.bold,
@@ -4230,7 +4540,7 @@ class _SellMedicineAndInventoryPageState
                                             ),
                                           ),
                                         Text(
-                                          '🔢 Batch: $batch',
+                                          '🔄 $activeBatches active batch(es)',
                                           style: const TextStyle(
                                             color: Colors.white60,
                                             fontSize: 11,
@@ -4239,12 +4549,7 @@ class _SellMedicineAndInventoryPageState
                                       ],
                                     ),
                                   ),
-                                  if (isExpired)
-                                    const Icon(
-                                      Icons.block,
-                                      color: Colors.redAccent,
-                                    )
-                                  else if (outOfStock)
+                                  if (outOfStock)
                                     const Icon(
                                       Icons.remove_circle_outline,
                                       color: Colors.grey,
@@ -4258,87 +4563,81 @@ class _SellMedicineAndInventoryPageState
                                 ],
                               ),
                               const SizedBox(height: 8),
-                              FutureBuilder<Map<String, dynamic>>(
-                                future: _fetchRealCartonInfo(medicineName),
-                                builder: (ctx, snap) {
-                                  final int cartonCount =
-                                      snap.data?['cartonCount'] as int? ?? 1;
-                                  final int totalBoxes =
-                                      snap.data?['totalBoxes'] as int? ?? qty;
-                                  final int avgBoxes =
-                                      snap.data?['avgBoxes'] as int? ?? qty;
-                                  return Wrap(
-                                    spacing: 6,
-                                    runSpacing: 4,
-                                    children: [
-                                      _badge(
-                                        '📦 $qty boxes',
-                                        qty > 0
-                                            ? Colors.blueAccent
-                                            : Colors.grey,
-                                      ),
-                                      _badge(
-                                        '💊 $stripsRem strips',
-                                        qty > 0
-                                            ? Colors.greenAccent
-                                            : Colors.grey,
-                                      ),
-                                      _badge(
-                                        '🏭 $cartonCount carton(s)  •  $avgBoxes avg boxes  •  $totalBoxes total',
-                                        Colors.orange,
-                                      ),
-                                      _badge(
-                                        _expiryLabel(
-                                          m['expiry_date']?.toString(),
-                                        ),
-                                        statusColor,
-                                      ),
-                                    ],
-                                  );
-                                },
-                              ),
-                              const SizedBox(height: 4),
-                              Text(
-                                '🏭 ${m['cartons']?['manufacturers']?['name'] ?? 'Unknown'}  |  BDT ${m['price']}',
-                                style: const TextStyle(
-                                  color: Colors.white54,
-                                  fontSize: 11,
-                                ),
-                              ),
-                              if (isExpired) ...[
-                                const SizedBox(height: 6),
+                              if (isLowStock)
                                 Container(
+                                  width: double.infinity,
                                   padding: const EdgeInsets.symmetric(
                                     horizontal: 8,
-                                    vertical: 3,
+                                    vertical: 4,
                                   ),
+                                  margin: const EdgeInsets.only(bottom: 6),
                                   decoration: BoxDecoration(
                                     color: const Color.fromRGBO(
                                       255,
-                                      82,
-                                      82,
+                                      152,
+                                      0,
                                       0.15,
                                     ),
                                     borderRadius: BorderRadius.circular(8),
                                     border: Border.all(
                                       color: const Color.fromRGBO(
                                         255,
-                                        82,
-                                        82,
+                                        152,
+                                        0,
                                         0.5,
                                       ),
                                     ),
                                   ),
-                                  child: const Text(
-                                    '⛔ EXPIRED — Cannot be sold',
-                                    style: TextStyle(
-                                      color: Colors.redAccent,
-                                      fontSize: 11,
-                                      fontWeight: FontWeight.bold,
-                                    ),
+                                  child: const Row(
+                                    children: [
+                                      Icon(
+                                        Icons.warning_amber,
+                                        color: Colors.orange,
+                                        size: 12,
+                                      ),
+                                      SizedBox(width: 4),
+                                      Text(
+                                        '⚠️ LOW STOCK — Reorder soon!',
+                                        style: TextStyle(
+                                          color: Colors.orange,
+                                          fontSize: 11,
+                                          fontWeight: FontWeight.bold,
+                                        ),
+                                      ),
+                                    ],
                                   ),
                                 ),
-                              ] else if (outOfStock) ...[
+                              Wrap(
+                                spacing: 6,
+                                runSpacing: 4,
+                                children: [
+                                  _badge(
+                                    '📦 $totalBoxes boxes total',
+                                    totalBoxes > 0
+                                        ? Colors.blueAccent
+                                        : Colors.grey,
+                                  ),
+                                  _badge(
+                                    '💊 $totalStrips strips total',
+                                    totalBoxes > 0
+                                        ? Colors.greenAccent
+                                        : Colors.grey,
+                                  ),
+                                  _badge(
+                                    _expiryLabel(earliestExpiry),
+                                    expColor,
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                '🏭 $mfrName  |  BDT ${m['price']}',
+                                style: const TextStyle(
+                                  color: Colors.white54,
+                                  fontSize: 11,
+                                ),
+                              ),
+                              if (outOfStock) ...[
                                 const SizedBox(height: 6),
                                 Container(
                                   padding: const EdgeInsets.symmetric(
@@ -4470,10 +4769,6 @@ class _SellMedicineAndInventoryPageState
   }
 
   // ── TAB 3: SUBSTITUTE ─────────────────────────────────────
-  // FEATURE 2: Scan Barcode button beside search field.
-  // When tapped → opens camera → scans barcode → looks up medicine in DB
-  // → gets medicine name → fills search field → auto-searches substitutes.
-  // No manual barcode input dialog is shown.
 
   Widget _buildSubstituteTab() {
     return Column(
@@ -4524,7 +4819,6 @@ class _SellMedicineAndInventoryPageState
               const SizedBox(height: 10),
               Row(
                 children: [
-                  // Manual text entry
                   Expanded(
                     child: TextField(
                       controller: _substituteSearchCtrl,
@@ -4565,10 +4859,6 @@ class _SellMedicineAndInventoryPageState
                     ),
                   ),
                   const SizedBox(width: 8),
-
-                  // ── BARCODE SCAN BUTTON for Substitute tab ──
-                  // Opens camera directly — no manual input dialog.
-                  // Scan → lookup medicine → fill trade name → search.
                   Container(
                     decoration: BoxDecoration(
                       color: Colors.teal,
@@ -4583,24 +4873,14 @@ class _SellMedicineAndInventoryPageState
                       onPressed: _searchingSubstitute
                           ? null
                           : () async {
-                              // Step 1: Open camera and scan — no dialog
                               final String? scanned =
                                   await _scanBarcodeCamera();
-
-                              if (scanned == null || scanned.isEmpty) {
-                                return; // User cancelled
-                              }
-
+                              if (scanned == null || scanned.isEmpty) return;
                               setState(() => _searchingSubstitute = true);
-
-                              // Step 2: Look up medicine using scanned value
                               final Map<String, dynamic>? found =
                                   await _lookupMedicineByBarcode(scanned);
-
                               if (!mounted) return;
-
                               if (found == null) {
-                                // Nothing found for this barcode
                                 setState(() => _searchingSubstitute = false);
                                 ScaffoldMessenger.of(context).showSnackBar(
                                   const SnackBar(
@@ -4613,11 +4893,8 @@ class _SellMedicineAndInventoryPageState
                                 );
                                 return;
                               }
-
-                              // Step 3: Get the medicine name and fill field
                               final String medicineName =
                                   found['medicine_name']?.toString() ?? '';
-
                               if (medicineName.isEmpty) {
                                 setState(() => _searchingSubstitute = false);
                                 _error(
@@ -4625,22 +4902,15 @@ class _SellMedicineAndInventoryPageState
                                 );
                                 return;
                               }
-
-                              // Step 4: Fill search field with medicine name
                               setState(() {
                                 _substituteSearchCtrl.text = medicineName;
                                 _searchingSubstitute = false;
                               });
-
-                              // Step 5: Auto-run substitute search
                               _searchSubstitutes();
                             },
                     ),
                   ),
-
                   const SizedBox(width: 8),
-
-                  // Manual search button
                   Container(
                     decoration: BoxDecoration(
                       color: Colors.purple,
@@ -4976,7 +5246,18 @@ class _SellMedicineAndInventoryPageState
                         borderRadius: BorderRadius.circular(10),
                       ),
                     ),
-                    onPressed: canSell ? () => _showSellDialog(m) : null,
+                    onPressed: canSell
+                        ? () => _showSellDialog({
+                            'medicine_name': m['medicine_name'],
+                            'generic_name': m['generic_name'],
+                            'total_boxes': qty,
+                            'total_strips': stripsRem,
+                            'batches': [m],
+                            'earliest_expiry': m['expiry_date']?.toString(),
+                            'cartons': m['cartons'],
+                            'price': m['price'],
+                          })
+                        : null,
                     child: Text(
                       canSell
                           ? 'Sell'
